@@ -12,10 +12,9 @@ import { spawn } from 'node:child_process';
 import { existsSync, watch } from 'node:fs';
 import { promises as fs_async } from 'node:fs'; // Renamed to avoid conflict with 'fs' module if used synchronously
 import { homedir } from 'node:os';
-// --- BEGIN MODIFICATION: Ensure all necessary path functions are imported ---
-import { join, resolve as pathResolve, normalize as pathNormalize, sep as pathSep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve as pathResolve, normalize as pathNormalize, sep as pathSep } from 'node:path';
 import * as path from 'path'; // Ensure 'path' module is available for path.sep
-// --- END MODIFICATION ---
 import * as os from 'os'; // Added os import
 import retry from 'async-retry';
 // import packageJson from '../package.json' with { type: 'json' }; // Import package.json with attribute
@@ -543,7 +542,20 @@ The 'workFolder' argument must be an absolute path within the server's configure
         let stderr_from_converter = '';
         try {
           const pythonPath = 'python3'; 
-          const converterScriptPath = pathResolve(__dirname, '../docs/task_converter.py');
+          const currentModuleUrl = import.meta.url;
+          const currentModulePath = fileURLToPath(currentModuleUrl); // Use fileURLToPath
+          const currentModuleDir = dirname(currentModulePath);       // Use dirname
+          
+          // Note: On Windows, fileURLToPath might return a path like /C:/...
+          // path.resolve will handle this correctly.
+          const converterScriptPath = pathResolve(currentModuleDir, '../docs/task_converter.py');
+          // --- END CORRECTION for __dirname in ES Modules ---
+          
+          debugLog(`[Debug] Path to converter script: ${converterScriptPath}`); 
+          if (!existsSync(converterScriptPath)) {
+            this.activeRequests.delete(requestId);
+            throw new McpError(ErrorCode.InternalError, `Task converter script not found at ${converterScriptPath}. Check server installation.`);
+          }
           const pythonArgs = ['--json-output', markdownFileFullPath, '--project-path', workFolder_conv];
           
           const result = await spawnAsync(pythonPath, [converterScriptPath, ...pythonArgs], {
@@ -567,7 +579,7 @@ The 'workFolder' argument must be an absolute path within the server's configure
           }
           
           if (stderr_from_converter && stderr_from_converter.toLowerCase().includes('error')) { 
-            const validationError = { status: 'error', error: 'Markdown conversion process reported errors', details: stderr_from_converter, helpUrl: 'https://github.com/grahama1970/claude-code-mcp-enhanced/blob/main/README.md#markdown-task-file-format' };
+            const validationError = { status: 'error', error: 'Markdown conversion process reported errors', details: stderr_from_converter, helpUrl: 'https://github.com/sfearl1/claude-code-mcp/blob/main/README.md#markdown-task-file-format' };
             this.activeRequests.delete(requestId);
             return { content: [{ type: 'text', text: JSON.stringify(validationError, null, 2) }] };
           }
@@ -586,7 +598,7 @@ The 'workFolder' argument must be an absolute path within the server's configure
           this.activeRequests.delete(requestId);
           const errorMessage = error instanceof Error ? error.message : String(error);
           const details = stderr_from_converter || errorMessage; 
-          const finalError = { status: 'error', error: 'Task conversion failed', details: details, helpUrl: 'https://github.com/grahama1970/claude-code-mcp-enhanced/blob/main/README.md#markdown-task-file-format' };
+          const finalError = { status: 'error', error: 'Task conversion failed', details: details, helpUrl: 'https://github.com/sfearl1/claude-code-mcp/blob/main/README.md#markdown-task-file-format' };
           return { content: [{ type: 'text', text: JSON.stringify(finalError, null, 2) }] };
         }
         // --- END MODIFICATIONS for convert_task_markdown logic ---

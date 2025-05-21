@@ -15,9 +15,9 @@ Get up and running with Claude Code MCP Enhanced in under 5 minutes!
    ```json
    {
      "mcpServers": {
-       "claude-code-mcp-enhanced": {
+       "claude-code-mcp": {
          "command": "npx",
-         "args": ["github:grahama1970/claude-code-mcp-enhanced"],
+         "args": ["github:sfearl1/claude-code-mcp"],
          "env": {
            "MCP_CLAUDE_DEBUG": "false"
          }
@@ -160,7 +160,7 @@ Use convert_task_markdown to convert my tasks.md file to MCP commands
 
 ## 🆘 Need Help?
 
-- [GitHub Issues](https://github.com/grahama1970/claude-code-mcp-enhanced/issues)
+- [GitHub Issues](https://github.com/sfearl1/claude-code-mcp/issues)
 - [Full Documentation](README.md)
 - [Troubleshooting Guide](README.md#-troubleshooting)
 

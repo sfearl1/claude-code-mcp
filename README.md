@@ -54,10 +54,10 @@ Add the following to your `.mcp.json` file:
 ```json
 {
   "mcpServers": {
-    "claude-code-mcp-enhanced": {
+    "claude-code-mcp": {
       "command": "npx",
       "args": [
-        "github:grahama1970/claude-code-mcp-enhanced"
+        "github:sfearl1/claude-code-mcp"
       ],
       "env": {
         "MCP_CLAUDE_DEBUG": "false",
@@ -76,11 +76,11 @@ If the package is published to npm, you can install it using the npm package nam
 ```json
 {
   "mcpServers": {
-    "claude-code-mcp-enhanced": {
+    "claude-code": {
       "command": "npx",
       "args": [
         "-y",
-        "@grahama1970/claude-code-mcp-enhanced@latest"
+        "claude-code-mcp"
       ],
       "env": {
         "MCP_CLAUDE_DEBUG": "false",
@@ -98,8 +98,8 @@ For development or testing purposes, you can run the server from a local install
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/grahama1970/claude-code-mcp-enhanced.git
-   cd claude-code-mcp-enhanced
+   git clone https://github.com/sfearl1/claude-code-mcp.git
+   cd claude-code-mcp
    ```
 
 2. Install dependencies and build:
@@ -113,10 +113,10 @@ For development or testing purposes, you can run the server from a local install
 ```json
 {
   "mcpServers": {
-    "claude-code-mcp-enhanced": {
+    "claude-code-mcp": {
       "command": "node",
       "args": [
-        "/path/to/claude-code-mcp-enhanced/dist/server.js"
+        "/path/to/claude-code-mcp/dist/server.js"
       ],
       "env": {
         "MCP_CLAUDE_DEBUG": "false",
@@ -559,7 +559,7 @@ The task converter enforces a specific markdown structure to ensure consistent a
   "status": "error",
   "error": "Markdown format validation failed",
   "details": "Markdown format validation failed:\n  - Missing required title. Format: '# Task NNN: Title'\n  - Missing or empty 'Requirements' section. Format: '## Requirements\\n1. [ ] Requirement'\n  - No validation tasks found. Format: '- [ ] Validate `module.py`' with indented steps\n\nRequired markdown format:\n# Task NNN: Title\n## Objective\nClear description\n## Requirements\n1. [ ] First requirement\n## Task Section\n- [ ] Validate `file.py`\n   - [ ] Step 1\n   - [ ] Step 2",
-  "helpUrl": "https://github.com/grahama1970/claude-code-mcp-enhanced/blob/main/README.md#markdown-task-file-format"
+  "helpUrl": "https://github.com/sfearl1/claude-code-mcp/blob/main/README.md#markdown-task-file-format"
 }
 ```
 
@@ -899,9 +899,9 @@ This MCP server supports integration with specialized modes through a `.roomodes
    ```json
    {
      "mcpServers": {
-       "claude-code-mcp-enhanced": {
+       "claude-code-mcp": {
          "command": "npx",
-         "args": ["github:grahama1970/claude-code-mcp-enhanced"],
+         "args": ["github:sfearl1/claude-code-mcp"],
          "env": {
            "MCP_USE_ROOMODES": "true",
            "MCP_WATCH_ROOMODES": "true",
@@ -1081,7 +1081,7 @@ If you want to develop or contribute to this server, or run it from a cloned rep
 
 Contributions are welcome! Please refer to the [Local Installation & Development Setup Guide](./docs/local_install.md) for details on setting up your environment.
 
-Submit issues and pull requests to the [GitHub repository](https://github.com/grahama1970/claude-code-mcp-enhanced).
+Submit issues and pull requests to the [GitHub repository](https://github.com/sfearl1/claude-code-mcp).
 
 ## ⚖️ License
 
@@ -1092,7 +1092,7 @@ MIT
 If you encounter any issues or have questions about using the Claude Code MCP server, please:
 
 1. Check the Troubleshooting section above
-2. Submit an issue on the [GitHub repository](https://github.com/grahama1970/claude-code-mcp-enhanced)
+2. Submit an issue on the [GitHub repository](https://github.com/sfearl1/claude-code-mcp)
 3. Join the discussion in the repository discussions section
 
 We appreciate your feedback and contributions to making this tool better!
