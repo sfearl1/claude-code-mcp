@@ -10,13 +10,48 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'node:child_process';
 import { existsSync, watch } from 'node:fs';
-import { promises as fs } from 'node:fs';
+import { promises as fs_async } from 'node:fs'; // Renamed to avoid conflict with 'fs' module if used synchronously
 import { homedir } from 'node:os';
-import { join, resolve as pathResolve } from 'node:path';
-import * as path from 'path';
+// --- BEGIN MODIFICATION: Ensure all necessary path functions are imported ---
+import { join, resolve as pathResolve, normalize as pathNormalize, sep as pathSep } from 'node:path';
+import * as path from 'path'; // Ensure 'path' module is available for path.sep
+// --- END MODIFICATION ---
 import * as os from 'os'; // Added os import
 import retry from 'async-retry';
-import packageJson from '../package.json' with { type: 'json' }; // Import package.json with attribute
+// import packageJson from '../package.json' with { type: 'json' }; // Import package.json with attribute
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const packageJson = require('../package.json');
+
+// --- BEGIN MODIFICATION ---
+// --- Configuration for Guardrails ---
+const rawAllowedBaseDir = process.env.MCP_ALLOWED_BASE_DIR;
+if (!rawAllowedBaseDir) {
+    console.error("[Critical Error] MCP_ALLOWED_BASE_DIR environment variable is not set. This is required for security. Server will not start.");
+    process.exit(1); 
+}
+// Resolve '~' to home directory and then normalize + resolve the path
+const resolvedRawAllowedBaseDir = rawAllowedBaseDir.startsWith(`~${path.sep}`) 
+    ? path.join(homedir(), rawAllowedBaseDir.substring(2)) 
+    : (rawAllowedBaseDir === '~' ? homedir() : rawAllowedBaseDir);
+
+const ALLOWED_BASE_WORK_DIRECTORY = pathNormalize(pathResolve(resolvedRawAllowedBaseDir));
+
+
+const DANGEROUS_COMMAND_PATTERNS: RegExp[] = [
+    /rm -rf \//,         // Deleting root
+    /rm -rf \.\.\//,     // Deleting parent directory content
+    /rm -rf ~/,          // Deleting home directory
+    /sudo rm/,           // Sudo remove
+    /mkfs/,              // Formatting disks
+    /> \/dev\/sd[a-z]/,  // Writing directly to disk devices
+    /dd if=\/dev\/zero of=\/dev\/sd[a-z]/, // Wiping disks
+    /:(){:|:&};:/,       // Fork bomb
+    /\^.\*\/c\/\^.\*\/c\/\^.\*\/c/, // Another fork bomb variant
+    // Add more patterns as needed
+];
+// --- End Configuration for Guardrails ---
+// --- END MODIFICATION ---
 
 // Define environment variables globally
 const debugMode = process.env.MCP_CLAUDE_DEBUG === 'true';
@@ -64,12 +99,23 @@ function findClaudeCli(): string {
  */
 interface ClaudeCodeArgs {
   prompt: string;
-  workFolder?: string;
+  workFolder?: string; // Will be validated to be within ALLOWED_BASE_WORK_DIRECTORY
   parentTaskId?: string;
   returnMode?: 'summary' | 'full';
   taskDescription?: string;
   mode?: string; // Roo mode to use (matches slug in .roomodes)
 }
+
+// --- BEGIN MODIFICATION ---
+/**
+ * Interface for Convert Task Markdown tool arguments
+ */
+interface ConvertTaskMarkdownArgs {
+    markdownPath: string; // Relative to workFolder
+    workFolder: string; // Absolute path, must be within ALLOWED_BASE_WORK_DIRECTORY
+    outputPath?: string; // Relative to workFolder
+}
+// --- END MODIFICATION ---
 
 // Cache for Roo modes configuration to improve performance
 let roomodesCache: { data: any, timestamp: number } | null = null;
@@ -115,8 +161,8 @@ function loadRooModes(): any {
     }
     
     // Check if we have a fresh cached version
-    const fs = require('fs');
-    const stats = fs.statSync(roomodesPath);
+    const fs_sync = require('fs'); // Use require for sync fs ops in this function
+    const stats = fs_sync.statSync(roomodesPath);
     const fileModifiedTime = stats.mtimeMs;
     
     // Use cache if available and fresh
@@ -128,7 +174,7 @@ function loadRooModes(): any {
     }
     
     // Otherwise read the file and update cache
-    const roomodesContent = fs.readFileSync(roomodesPath, 'utf8');
+    const roomodesContent = fs_sync.readFileSync(roomodesPath, 'utf8');
     const parsedData = JSON.parse(roomodesContent);
     
     // Update cache
@@ -152,9 +198,9 @@ function loadRooModes(): any {
  */
 async function spawnAsync(command: string, args: string[], options?: { timeout?: number, cwd?: string }): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    debugLog(`[Spawn] Running command: ${command} ${args.join(' ')}`);
-    const process = spawn(command, args, {
-      shell: false, // Reverted to false
+    debugLog(`[Spawn] Running command: ${command} ${args.join(' ')} in CWD: ${options?.cwd}`);
+    const proc = spawn(command, args, { // Renamed to proc
+      shell: false, 
       timeout: options?.timeout,
       cwd: options?.cwd,
       stdio: ['ignore', 'pipe', 'pipe']
@@ -165,26 +211,23 @@ async function spawnAsync(command: string, args: string[], options?: { timeout?:
     let executionStartTime = Date.now();
     let heartbeatCounter = 0;
 
-    // Set up progress reporter to prevent client timeouts
-    // Send a heartbeat message at the configured interval
     const progressReporter = setInterval(() => {
       heartbeatCounter++;
       const elapsedSeconds = Math.floor((Date.now() - executionStartTime) / 1000);
       const heartbeatMessage = `[Progress] Claude Code execution in progress: ${elapsedSeconds}s elapsed (heartbeat #${heartbeatCounter})`;
       
-      // Log heartbeat to stderr which will be seen by the client
-      console.error(heartbeatMessage);
-      debugLog(heartbeatMessage);
+      console.error(heartbeatMessage); 
+      debugLog(heartbeatMessage); 
     }, heartbeatIntervalMs);
 
-    process.stdout.on('data', (data) => { stdout += data.toString(); });
-    process.stderr.on('data', (data) => {
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => {
       stderr += data.toString();
       debugLog(`[Spawn Stderr Chunk] ${data.toString()}`);
     });
 
-    process.on('error', (error: NodeJS.ErrnoException) => {
-      clearInterval(progressReporter); // Clean up the interval
+    proc.on('error', (error: NodeJS.ErrnoException) => {
+      clearInterval(progressReporter); 
       debugLog(`[Spawn Error Event] Full error object:`, error);
       let errorMessage = `Spawn error: ${error.message}`;
       if (error.path) {
@@ -197,8 +240,8 @@ async function spawnAsync(command: string, args: string[], options?: { timeout?:
       reject(new Error(errorMessage));
     });
 
-    process.on('close', (code) => {
-      clearInterval(progressReporter); // Clean up the interval
+    proc.on('close', (code) => {
+      clearInterval(progressReporter); 
       const executionTimeMs = Date.now() - executionStartTime;
       debugLog(`[Spawn Close] Exit code: ${code}, Execution time: ${executionTimeMs}ms`);
       debugLog(`[Spawn Stderr Full] ${stderr.trim()}`);
@@ -212,69 +255,72 @@ async function spawnAsync(command: string, args: string[], options?: { timeout?:
   });
 }
 
+// --- BEGIN MODIFICATION ---
+// Helper function to check if a path is within the allowed base directory
+function isPathSafe(pathToTest: string, allowedBase: string): boolean {
+    const normalizedPathToTest = pathNormalize(pathResolve(pathToTest));
+    const normalizedAllowedBase = pathNormalize(pathResolve(allowedBase));
+    return normalizedPathToTest.startsWith(normalizedAllowedBase + pathSep) || normalizedPathToTest === normalizedAllowedBase;
+}
+// --- END MODIFICATION ---
+
 /**
  * MCP Server for Claude Code
  * Provides a simple MCP tool to run Claude CLI in one-shot mode
  */
 class ClaudeCodeServer {
   private server: Server;
-  private claudeCliPath: string; // This now holds either a full path or just 'claude'
-  private packageVersion: string; // Add packageVersion property
-  private activeRequests: Set<string> = new Set(); // Track active request IDs
+  private claudeCliPath: string; 
+  private packageVersion: string; 
+  private activeRequests: Set<string> = new Set(); 
 
   constructor() {
-    // Use the simplified findClaudeCli function
-    this.claudeCliPath = findClaudeCli(); // Removed debugMode argument
+    this.claudeCliPath = findClaudeCli(); 
     console.error(`[Setup] Using Claude CLI command/path: ${this.claudeCliPath}`);
-    this.packageVersion = packageJson.version; // Access version directly
+    // --- BEGIN MODIFICATION ---
+    console.error(`[Setup] Allowed base working directory: ${ALLOWED_BASE_WORK_DIRECTORY}`); 
+    if (!existsSync(ALLOWED_BASE_WORK_DIRECTORY)) {
+        console.warn(`[Warning] ALLOWED_BASE_WORK_DIRECTORY "${ALLOWED_BASE_WORK_DIRECTORY}" does not exist. Some operations might fail if it's not created.`);
+    }
+    // --- END MODIFICATION ---
+    this.packageVersion = packageJson.version; 
 
     this.server = new Server(
       {
-        name: 'claude_code',
-        version: '1.0.0',
+        name: 'claude_code_mcp_server', // Server name, not tool name prefix
+        version: this.packageVersion, 
       },
       {
         capabilities: {
-          tools: {},
+          tools: {}, 
         },
       }
     );
 
     this.setupToolHandlers();
 
-    // Improved error handling and graceful shutdown
-    this.server.onerror = (error) => console.error('[Error]', error);
+    this.server.onerror = (error) => console.error('[MCP Server Error]', error); 
     
-    // Handle shutdown signals
     const handleShutdown = async (signal: string) => {
       console.error(`[Shutdown] Received ${signal} signal. Graceful shutdown initiated.`);
-      
-      // If there are active requests, wait briefly for them to complete
       if (this.activeRequests.size > 0) {
         console.error(`[Shutdown] Waiting for ${this.activeRequests.size} active requests to complete...`);
-        
-        // Wait up to 10 seconds for active requests to complete
         const shutdownTimeoutMs = 10000;
         const shutdownStart = Date.now();
-        
         while (this.activeRequests.size > 0 && (Date.now() - shutdownStart) < shutdownTimeoutMs) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
-        
         if (this.activeRequests.size > 0) {
           console.error(`[Shutdown] ${this.activeRequests.size} requests still active after timeout. Proceeding with shutdown anyway.`);
         } else {
           console.error('[Shutdown] All active requests completed successfully.');
         }
       }
-      
-      // Close the server
       await this.server.close();
       console.error('[Shutdown] Server closed. Exiting process.');
       process.exit(0);
     };
     
-    // Register signal handlers
     process.on('SIGINT', () => handleShutdown('SIGINT'));
     process.on('SIGTERM', () => handleShutdown('SIGTERM'));
   }
@@ -283,12 +329,10 @@ class ClaudeCodeServer {
    * Set up the MCP tool handlers
    */
   private setupToolHandlers(): void {
-    // Define available tools
-    // Add a health check and version info tool
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
-          name: 'health',
+          name: 'health', 
           description: 'Returns health status, version information, and current configuration of the Claude Code MCP server.',
           inputSchema: {
             type: 'object',
@@ -298,24 +342,31 @@ class ClaudeCodeServer {
         },
         {
           name: 'convert_task_markdown',
-          description: 'Converts markdown task files into Claude Code MCP-compatible JSON format. Returns an array of tasks that can be executed using the claude_code tool.',
+          // --- BEGIN MODIFICATION for convert_task_markdown description and inputSchema ---
+          description: `Converts markdown task files into Claude Code MCP-compatible JSON format. Returns an array of tasks that can be executed using the claude_code tool. The 'workFolder' argument must be an absolute path within the server's configured allowed base directory.`,
           inputSchema: {
             type: 'object',
             properties: {
               markdownPath: {
                 type: 'string',
-                description: 'Path to the markdown task file to convert.',
+                description: 'Relative path from workFolder to the markdown task file to convert.',
+              },
+              workFolder: { 
+                type: 'string',
+                description: `The absolute path to the project root. Must be within the server's allowed base directory (${ALLOWED_BASE_WORK_DIRECTORY}).`,
               },
               outputPath: {
                 type: 'string',
-                description: 'Optional path where to save the JSON output. If not provided, returns the JSON directly.',
+                description: 'Optional relative path from workFolder where to save the JSON output. If not provided, returns the JSON directly.',
               },
             },
-            required: ['markdownPath'],
+            required: ['markdownPath', 'workFolder'], 
           },
+          // --- END MODIFICATION for convert_task_markdown description and inputSchema ---
         },
         {
           name: 'claude_code',
+          // --- BEGIN MODIFICATION for claude_code description and inputSchema ---
           description: `Claude Code Agent: Your versatile multi-modal assistant for code, file, Git, and terminal operations via Claude CLI. Use \`workFolder\` for contextual execution.
 
 • File ops: Create, read, (fuzzy) edit, move, copy, delete, list files, analyze/ocr images, file content analysis
@@ -355,7 +406,8 @@ class ClaudeCodeServer {
 8. **Task Orchestration**: For complex workflows, use \`parentTaskId\` to create subtasks and \`returnMode: "summary"\` to get concise results back.
 9. Claude can do much more, just ask it!
 
-        `,
+The 'workFolder' argument must be an absolute path within the server's configured allowed base directory (${ALLOWED_BASE_WORK_DIRECTORY}).
+        `, 
           inputSchema: {
             type: 'object',
             properties: {
@@ -363,9 +415,9 @@ class ClaudeCodeServer {
                 type: 'string',
                 description: 'The detailed natural language prompt for Claude to execute.',
               },
-              workFolder: {
+              workFolder: { 
                 type: 'string',
-                description: 'Mandatory when using file operations or referencing any file. The working directory for the Claude CLI execution.',
+                description: `Mandatory. The absolute working directory for the Claude CLI execution. Must be within the server's allowed base directory (${ALLOWED_BASE_WORK_DIRECTORY}).`,
               },
               parentTaskId: {
                 type: 'string',
@@ -385,408 +437,316 @@ class ClaudeCodeServer {
                 description: 'When MCP_USE_ROOMODES=true, specifies the mode from .roomodes to use (e.g., "boomerang-mode", "coder", "designer", etc.).',
               },
             },
-            required: ['prompt'],
+            required: ['prompt', 'workFolder'], 
           },
+          // --- END MODIFICATION for claude_code description and inputSchema ---
         }
       ],
     }));
 
-    // Handle tool calls using the configurable execution timeout
     this.server.setRequestHandler(CallToolRequestSchema, async (args, call): Promise<ServerResult> => {
-      // Generate a unique request ID
       const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
       this.activeRequests.add(requestId);
-      
       debugLog(`[Debug] Handling CallToolRequest: ${requestId}`, args);
 
-      // Correctly access toolName from args.params.name (may include namespace)
-      const fullToolName = args.params.name;
-      // Extract the local tool name (remove namespace if present)
-      const toolName = fullToolName.includes(':') ? fullToolName.split(':')[1] : fullToolName;
-      
-      debugLog(`[Debug] Tool request: ${fullToolName}, Local tool name: ${toolName}`);
-      
-      // Handle health check tool
+      const fullToolNameFromRequest = args.params.name;
+      const toolName = fullToolNameFromRequest.includes(':') ? fullToolNameFromRequest.split(':')[1] : fullToolNameFromRequest;
+      debugLog(`[Debug] Full tool name from request: ${fullToolNameFromRequest}, Local tool name: ${toolName}`);
+
+      const toolArguments = args.params.arguments as any; 
+
       if (toolName === 'health') {
-        // Check if Claude CLI is accessible
         let claudeCliStatus = 'unknown';
         try {
-          const { stdout } = await spawnAsync('/bin/bash', [this.claudeCliPath, '--version'], { timeout: 5000 });
+          // --- BEGIN MODIFICATION (Original used /bin/bash, direct call is fine) ---
+          // The original spawnAsync call for health check was:
+          // const { stdout } = await spawnAsync('/bin/bash', [this.claudeCliPath, '--version'], { timeout: 5000 });
+          // Changing to direct call:
+          await spawnAsync(this.claudeCliPath, ['--version'], { timeout: 5000 });
+          // --- END MODIFICATION ---
           claudeCliStatus = 'available';
-        } catch (error) {
-          claudeCliStatus = 'unavailable';
-        }
-
-        // Collect and return system information
+        } catch (error) { claudeCliStatus = 'unavailable'; }
         const healthInfo = {
-          status: 'ok',
+          status: 'ok', 
           version: this.packageVersion,
-          claudeCli: {
-            path: this.claudeCliPath,
-            status: claudeCliStatus
+          claudeCli: { 
+            path: this.claudeCliPath, 
+            status: claudeCliStatus 
           },
-          config: {
-            debugMode,
-            heartbeatIntervalMs,
-            executionTimeoutMs,
-            useRooModes,
-            maxRetries,
-            retryDelayMs
+          config: { 
+            debugMode, 
+            heartbeatIntervalMs, 
+            executionTimeoutMs, 
+            useRooModes, 
+            maxRetries, 
+            retryDelayMs, 
+            // --- BEGIN MODIFICATION ---
+            allowedBaseWorkDirectory: ALLOWED_BASE_WORK_DIRECTORY 
+            // --- END MODIFICATION ---
           },
-          system: {
-            platform: os.platform(),
-            release: os.release(),
-            arch: os.arch(),
-            cpus: os.cpus().length,
-            memory: {
-              total: Math.round(os.totalmem() / (1024 * 1024)) + 'MB',
-              free: Math.round(os.freemem() / (1024 * 1024)) + 'MB'
+          system: { 
+            platform: os.platform(), 
+            release: os.release(), 
+            arch: os.arch(), 
+            cpus: os.cpus().length, 
+            memory: { 
+              total: Math.round(os.totalmem() / (1024 * 1024)) + 'MB', 
+              free: Math.round(os.freemem() / (1024 * 1024)) + 'MB' 
+            }, 
+              uptime: Math.round(os.uptime() / 60) + ' minutes' 
             },
-            uptime: Math.round(os.uptime() / 60) + ' minutes'
-          },
           timestamp: new Date().toISOString()
         };
-        
-        // Health check request completed, remove from tracking
         this.activeRequests.delete(requestId);
         debugLog(`[Debug] Health check request ${requestId} completed`);
-
         return { content: [{ type: 'text', text: JSON.stringify(healthInfo, null, 2) }] };
       }
-      
-      // Handle convert_task_markdown tool
+
       if (toolName === 'convert_task_markdown') {
-        const toolArguments = args.params.arguments;
-        
-        // Extract markdownPath (required)
-        let markdownPath: string;
-        if (
-          toolArguments &&
-          typeof toolArguments === 'object' &&
-          'markdownPath' in toolArguments &&
-          typeof toolArguments.markdownPath === 'string'
-        ) {
-          markdownPath = toolArguments.markdownPath;
-        } else {
-          throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: markdownPath for convert_task_markdown tool');
+        // --- BEGIN MODIFICATIONS for convert_task_markdown logic ---
+        const converterArgs = toolArguments as ConvertTaskMarkdownArgs; 
+        if (!converterArgs || typeof converterArgs.markdownPath !== 'string' || typeof converterArgs.workFolder !== 'string') {
+          this.activeRequests.delete(requestId);
+          throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameters: markdownPath (string) and workFolder (string) for convert_task_markdown tool');
         }
         
-        // Extract outputPath (optional)
-        let outputPath: string | undefined;
-        if (toolArguments.outputPath && typeof toolArguments.outputPath === 'string') {
-          outputPath = toolArguments.outputPath;
+        const workFolder_conv = pathNormalize(pathResolve(converterArgs.workFolder)); // Use a different variable name
+        if (!isPathSafe(workFolder_conv, ALLOWED_BASE_WORK_DIRECTORY)) {
+            this.activeRequests.delete(requestId);
+            throw new McpError(ErrorCode.InvalidParams, `convert_task_markdown: workFolder "${workFolder_conv}" is outside the allowed base directory "${ALLOWED_BASE_WORK_DIRECTORY}".`);
+        }
+        if (!existsSync(workFolder_conv)) { 
+            this.activeRequests.delete(requestId);
+            throw new McpError(ErrorCode.InvalidParams, `convert_task_markdown: workFolder "${workFolder_conv}" does not exist. It must exist to locate the markdown file.`);
+        }
+
+        const markdownFileFullPath = pathResolve(workFolder_conv, converterArgs.markdownPath);
+         if (!isPathSafe(markdownFileFullPath, workFolder_conv)) { 
+            this.activeRequests.delete(requestId);
+            throw new McpError(ErrorCode.InvalidParams, `convert_task_markdown: markdownPath "${converterArgs.markdownPath}" (resolved to ${markdownFileFullPath}) attempts to access outside of its workFolder "${workFolder_conv}".`);
+        }
+        if (!existsSync(markdownFileFullPath)) {
+            this.activeRequests.delete(requestId);
+            throw new McpError(ErrorCode.InvalidParams, `convert_task_markdown: Markdown file not found at resolved path: ${markdownFileFullPath}`);
+        }
+
+        let outputFileFullPath: string | undefined;
+        if (converterArgs.outputPath && typeof converterArgs.outputPath === 'string') {
+          outputFileFullPath = pathResolve(workFolder_conv, converterArgs.outputPath);
+           if (!isPathSafe(outputFileFullPath, workFolder_conv)) { 
+                this.activeRequests.delete(requestId);
+                throw new McpError(ErrorCode.InvalidParams, `convert_task_markdown: outputPath "${converterArgs.outputPath}" (resolved to ${outputFileFullPath}) attempts to access outside of its workFolder "${workFolder_conv}".`);
+            }
         }
         
-        debugLog(`[Debug] Converting markdown task file: ${markdownPath}`);
-        
-        let stderr = '';
-        
+        debugLog(`[Debug] Converting markdown task file: ${markdownFileFullPath} within project: ${workFolder_conv}`);
+        let stderr_from_converter = '';
         try {
-          // Prepare command to run task_converter.py
-          const pythonPath = 'python3';
-          const converterPath = pathResolve(__dirname, '../docs/task_converter.py');
+          const pythonPath = 'python3'; 
+          const converterScriptPath = pathResolve(__dirname, '../docs/task_converter.py');
+          const pythonArgs = ['--json-output', markdownFileFullPath, '--project-path', workFolder_conv];
           
-          // Use --json-output flag to get JSON to stdout
-          const args = ['--json-output', markdownPath];
-          
-          const result = await spawnAsync(pythonPath, [converterPath, ...args], {
-            cwd: homedir(),
-            timeout: 30000 // 30 seconds timeout
+          const result = await spawnAsync(pythonPath, [converterScriptPath, ...pythonArgs], {
+            cwd: workFolder_conv, 
+            timeout: 60000 
           });
           
-          const stdout = result.stdout;
-          stderr = result.stderr;
+          const stdout_from_converter = result.stdout;
+          stderr_from_converter = result.stderr;
           
-          // Extract progress messages and actual errors
-          const stderrLines = stderr.split('\n');
-          const progressMessages = stderrLines.filter(line => line.includes('[Progress]'));
-          const errorMessages = stderrLines.filter(line => !line.includes('[Progress]') && line.trim());
+          const stderrLines = stderr_from_converter.split('\n');
+          const progressMessages = stderrLines.filter(line => line.includes('[Progress]') || line.includes('[Warning]'));
+          const errorMessages = stderrLines.filter(line => !line.includes('[Progress]') && !line.includes('[Warning]') && line.trim());
           
-          // Log progress messages
-          progressMessages.forEach(msg => {
-            console.error(msg); // Send to client
-            debugLog(msg);
-          });
-          
-          if (errorMessages.length > 0) {
-            stderr = errorMessages.join('\n');
-            debugLog(`[Debug] Task converter stderr: ${stderr}`);
+          progressMessages.forEach(msg => { console.error(msg); debugLog(msg); });
+          if (errorMessages.length > 0) { 
+            stderr_from_converter = errorMessages.join('\n'); 
+            debugLog(`[Debug] Task converter error output: ${stderr_from_converter}`); 
+          } else if (progressMessages.length > 0 && !stderr_from_converter.toLowerCase().includes('error')) {
+            stderr_from_converter = ''; 
           }
           
-          // Check if there was an error from the converter
-          if (stderr && stderr.includes('Markdown format validation failed')) {
-            // Return validation error as a structured response
-            const validationError = {
-              status: 'error',
-              error: 'Markdown format validation failed',
-              details: stderr,
-              helpUrl: 'https://github.com/grahama1970/claude-code-mcp/blob/main/README.md#markdown-task-file-format'
-            };
-            
+          if (stderr_from_converter && stderr_from_converter.toLowerCase().includes('error')) { 
+            const validationError = { status: 'error', error: 'Markdown conversion process reported errors', details: stderr_from_converter, helpUrl: 'https://github.com/grahama1970/claude-code-mcp-enhanced/blob/main/README.md#markdown-task-file-format' };
             this.activeRequests.delete(requestId);
             return { content: [{ type: 'text', text: JSON.stringify(validationError, null, 2) }] };
           }
           
-          // Parse the JSON output
-          const tasks = JSON.parse(stdout);
-          
-          // If outputPath is provided, also save to file
-          if (outputPath) {
-            await fs.writeFile(outputPath, JSON.stringify(tasks, null, 2));
-            debugLog(`[Debug] Saved converted tasks to: ${outputPath}`);
+          const tasks = JSON.parse(stdout_from_converter);
+          if (outputFileFullPath) {
+            await fs_async.writeFile(outputFileFullPath, JSON.stringify(tasks, null, 2)); // Use fs_async
+            debugLog(`[Debug] Saved converted tasks to: ${outputFileFullPath}`);
           }
           
-          // Return the converted tasks
-          const response = {
-            status: 'success',
-            tasksCount: tasks.length,
-            outputPath: outputPath || 'none',
-            tasks: tasks
-          };
-          
+          const response = { status: 'success', tasksCount: tasks.length, outputPath: outputFileFullPath || 'none', tasks: tasks };
           this.activeRequests.delete(requestId);
           return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
           
-        } catch (error) {
+        } catch (error) { 
           this.activeRequests.delete(requestId);
           const errorMessage = error instanceof Error ? error.message : String(error);
-          
-          // Check if this is a JSON parsing error (indicating validation failure)
-          if (errorMessage.includes('JSON') && stderr) {
-            const validationError = {
-              status: 'error',
-              error: 'Task conversion failed',
-              details: stderr || errorMessage,
-              helpUrl: 'https://github.com/grahama1970/claude-code-mcp/blob/main/README.md#markdown-task-file-format'
-            };
-            return { content: [{ type: 'text', text: JSON.stringify(validationError, null, 2) }] };
-          }
-          
-          throw new McpError(ErrorCode.InternalError, `Failed to convert markdown tasks: ${errorMessage}`);
+          const details = stderr_from_converter || errorMessage; 
+          const finalError = { status: 'error', error: 'Task conversion failed', details: details, helpUrl: 'https://github.com/grahama1970/claude-code-mcp-enhanced/blob/main/README.md#markdown-task-file-format' };
+          return { content: [{ type: 'text', text: JSON.stringify(finalError, null, 2) }] };
+        }
+        // --- END MODIFICATIONS for convert_task_markdown logic ---
+      }
+      
+      // This check was in the original, ensuring it's still here
+      // If it's not health or convert_task_markdown, it must be claude_code or an error
+      if (toolName !== 'claude_code') { // Simplified this check as health and convert_task_markdown are handled above
+        this.activeRequests.delete(requestId);
+        throw new McpError(ErrorCode.MethodNotFound, `Tool ${toolName} not found on this server.`);
+      }
+
+      // --- BEGIN MODIFICATIONS for claude_code argument validation and guardrails ---
+      // The original file had a block here:
+      // if (toolName !== 'claude_code' && toolName !== 'health' && toolName !== 'convert_task_markdown') {
+      //   throw new McpError(ErrorCode.MethodNotFound, `Tool ${toolName} not found`);
+      // }
+      // This is now covered by the check above. The following logic is for 'claude_code'.
+
+      const claudeArgs = toolArguments as ClaudeCodeArgs; 
+      if (!claudeArgs || typeof claudeArgs.prompt !== 'string' || typeof claudeArgs.workFolder !== 'string') {
+        this.activeRequests.delete(requestId);
+        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameters: prompt (string) and workFolder (string) for claude_code tool');
+      }
+      
+      // Destructure after validation
+      let currentPrompt = claudeArgs.prompt; // Use new variable name to avoid redeclaration
+      let currentWorkFolder = claudeArgs.workFolder;
+      let currentParentTaskId = claudeArgs.parentTaskId;
+      let currentReturnMode = claudeArgs.returnMode || 'full';
+      let currentTaskDescription = claudeArgs.taskDescription;
+      let currentMode = claudeArgs.mode;
+
+      const currentEffectiveCwd = pathNormalize(pathResolve(currentWorkFolder!)); 
+      if (!isPathSafe(currentEffectiveCwd, ALLOWED_BASE_WORK_DIRECTORY)) {
+        this.activeRequests.delete(requestId);
+        throw new McpError(ErrorCode.InvalidParams, `claude_code: workFolder "${currentEffectiveCwd}" is outside the allowed base directory "${ALLOWED_BASE_WORK_DIRECTORY}".`);
+      }
+      
+      // Original logic for workFolder existence check (more lenient for claude_code)
+      if (!existsSync(currentEffectiveCwd)) {
+         // This was the original behavior for claude_code's workFolder check, so we keep it.
+        debugLog(`[Debug] claude_code: Specified workFolder "${currentEffectiveCwd}" does not exist. Claude CLI might create it if the prompt instructs to.`);
+      }
+
+
+      // Dangerous command check
+      for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+        if (pattern.test(currentPrompt)) { // Check currentPrompt
+            this.activeRequests.delete(requestId);
+            throw new McpError(ErrorCode.InvalidParams, `Prompt contains a potentially dangerous command pattern: ${pattern.toString()}. Execution blocked.`);
         }
       }
+      // --- END MODIFICATIONS for claude_code argument validation and guardrails ---
       
-      // Handle tools - we support 'health', 'claude_code', and 'convert_task_markdown'
-      if (toolName !== 'claude_code' && toolName !== 'health' && toolName !== 'convert_task_markdown') {
-        // ErrorCode.ToolNotFound should be ErrorCode.MethodNotFound as per SDK for tools
-        throw new McpError(ErrorCode.MethodNotFound, `Tool ${toolName} not found`);
-      }
-
-      // Robustly access arguments from args.params.arguments
-      const toolArguments = args.params.arguments;
-      let prompt: string;
-      let parentTaskId: string | undefined;
-      let returnMode: 'summary' | 'full' = 'full';
-      let taskDescription: string | undefined;
-      let mode: string | undefined;
-
-      // Validate and extract prompt (required)
-      if (
-        toolArguments &&
-        typeof toolArguments === 'object' &&
-        'prompt' in toolArguments &&
-        typeof toolArguments.prompt === 'string'
-      ) {
-        prompt = toolArguments.prompt;
-      } else {
-        throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: prompt (must be an object with a string "prompt" property) for claude_code tool');
-      }
-
-      // Extract optional parameters for task orchestration
-      if (toolArguments.parentTaskId && typeof toolArguments.parentTaskId === 'string') {
-        parentTaskId = toolArguments.parentTaskId;
-        debugLog(`[Debug] Task has parent ID: ${parentTaskId}`);
-      }
-
-      if (toolArguments.returnMode && 
-          (toolArguments.returnMode === 'summary' || toolArguments.returnMode === 'full')) {
-        returnMode = toolArguments.returnMode;
-        debugLog(`[Debug] Task return mode: ${returnMode}`);
-      }
-
-      if (toolArguments.taskDescription && typeof toolArguments.taskDescription === 'string') {
-        taskDescription = toolArguments.taskDescription;
-        debugLog(`[Debug] Task description: ${taskDescription}`);
-      }
-      
-      // Check for Roo mode
-      if (useRooModes && toolArguments.mode && typeof toolArguments.mode === 'string') {
-        mode = toolArguments.mode;
-        debugLog(`[Debug] Using Roo mode: ${mode}`);
-      }
-
-      // Determine the working directory
-      let effectiveCwd = homedir(); // Default CWD is user's home directory
-
-      // Check if workFolder is provided in the tool arguments
-      if (toolArguments.workFolder && typeof toolArguments.workFolder === 'string') {
-        const resolvedCwd = pathResolve(toolArguments.workFolder);
-        debugLog(`[Debug] Specified workFolder: ${toolArguments.workFolder}, Resolved to: ${resolvedCwd}`);
-
-        // Check if the resolved path exists
-        if (existsSync(resolvedCwd)) {
-          effectiveCwd = resolvedCwd;
-          debugLog(`[Debug] Using workFolder as CWD: ${effectiveCwd}`);
-        } else {
-          debugLog(`[Warning] Specified workFolder does not exist: ${resolvedCwd}. Using default: ${effectiveCwd}`);
-        }
-      } else {
-        debugLog(`[Debug] No workFolder provided, using default CWD: ${effectiveCwd}`);
-      }
-      
-      // For tasks with a parent, add boomerang context to the prompt
-      if (parentTaskId) {
-        // Prepend task context to prompt
+      // Original logic for parentTaskId, returnMode, taskDescription, mode using current* variables
+      if (currentParentTaskId) {
         const taskContext = `
 # Boomerang Task
-${taskDescription ? `## Task Description\n${taskDescription}\n\n` : ''}
+${currentTaskDescription ? `## Task Description\n${currentTaskDescription}\n\n` : ''}
 ## Parent Task ID
-${parentTaskId}
+${currentParentTaskId}
 
 ## Return Instructions
-You are part of a larger workflow. After completing your task, you should ${returnMode === 'summary' ? 'provide a BRIEF SUMMARY of the results' : 'return your FULL RESULTS'}.
+You are part of a larger workflow. After completing your task, you should ${currentReturnMode === 'summary' ? 'provide a BRIEF SUMMARY of the results' : 'return your FULL RESULTS'}.
 
-${returnMode === 'summary' ? 'IMPORTANT: Keep your response concise and focused on key findings/changes only!' : ''}
+${currentReturnMode === 'summary' ? 'IMPORTANT: Keep your response concise and focused on key findings/changes only!' : ''}
 
 ---
 
 `;
-        prompt = taskContext + prompt;
+        currentPrompt = taskContext + currentPrompt; // Modify currentPrompt
         debugLog(`[Debug] Prepended boomerang task context to prompt`);
       }
-
+      
       try {
-        debugLog(`[Debug] Attempting to execute Claude CLI with prompt: "${prompt}" in CWD: "${effectiveCwd}"`);
-
-        let claudeProcessArgs = [this.claudeCliPath, '--dangerously-skip-permissions'];
+        debugLog(`[Debug] Attempting to execute Claude CLI with prompt: "${currentPrompt.substring(0,100)}..." in CWD: "${currentEffectiveCwd}"`);
         
-        // Handle Roo mode selection if enabled and specified
-        if (useRooModes && mode) {
-          // Load room modes configuration
+        let claudeProcessArgs = ['--dangerously-skip-permissions']; 
+        
+        if (useRooModes && currentMode) { // Use currentMode
           const roomodes = loadRooModes();
           if (roomodes && roomodes.customModes) {
-            // Find the matching mode
-            const selectedMode = roomodes.customModes.find((m: any) => m.slug === mode);
+            const selectedMode = roomodes.customModes.find((m: any) => m.slug === currentMode); // Use currentMode
             if (selectedMode) {
-              debugLog(`[Debug] Found Roo mode configuration for: ${mode}`);
-              // Add the mode parameter to the Claude CLI command
+              debugLog(`[Debug] Found Roo mode configuration for: ${currentMode}`); // Use currentMode
               claudeProcessArgs.push('--role', selectedMode.roleDefinition);
-              // If the mode has a specific model, use it
               if (selectedMode.apiConfiguration && selectedMode.apiConfiguration.modelId) {
                 claudeProcessArgs.push('--model', selectedMode.apiConfiguration.modelId);
               }
-            } else {
-              debugLog(`[Warning] Specified Roo mode not found: ${mode}`);
-            }
-          } else {
-            debugLog(`[Warning] Roo modes configuration not found or invalid`);
-          }
+            } else { debugLog(`[Warning] Specified Roo mode "${currentMode}" not found in .roomodes`); } // Use currentMode
+          } else { debugLog(`[Warning] Roo modes configuration not found or invalid, cannot apply mode: ${currentMode}`); } // Use currentMode
         }
+        claudeProcessArgs.push('-p', currentPrompt); // Use currentPrompt
         
-        // Add the prompt
-        claudeProcessArgs.push('-p', prompt);
-        
-        debugLog(`[Debug] Invoking /bin/bash with args: ${claudeProcessArgs.join(' ')}`);
+        // The original code used /bin/bash here. We are now calling claudeCliPath directly.
+        debugLog(`[Debug] Invoking Claude CLI (${this.claudeCliPath}) with args: ${claudeProcessArgs.join(' ')}`);
 
-        // Use retry for robust execution
         const { stdout, stderr } = await retry(
           async (bail: (err: Error) => void, attemptNumber: number) => {
             try {
               if (attemptNumber > 1) {
                 debugLog(`[Retry] Attempt ${attemptNumber}/${maxRetries + 1} for Claude CLI execution`);
               }
-              
-              return await spawnAsync(
-                '/bin/bash', // Explicitly use /bin/bash as the command
-                claudeProcessArgs, // Pass the script path as the first argument to bash
-                { timeout: executionTimeoutMs, cwd: effectiveCwd }
-              );
+              return await spawnAsync(this.claudeCliPath, claudeProcessArgs, { timeout: executionTimeoutMs, cwd: currentEffectiveCwd }); // Use currentEffectiveCwd
             } catch (err: any) {
-              // Log the error
               debugLog(`[Retry] Error during attempt ${attemptNumber}/${maxRetries + 1}: ${err.message}`);
-              
-              // Determine if we should retry based on the error
               const isNetworkError = err.message.includes('ECONNRESET') || 
                                     err.message.includes('ETIMEDOUT') ||
                                     err.message.includes('ECONNREFUSED');
-                                    
               const isTransientError = isNetworkError || 
-                                      err.message.includes('429') || // Rate limit
-                                      err.message.includes('500'); // Server error
-              
-              // If it's not a transient error, bail immediately
-              if (!isTransientError) {
-                debugLog(`[Retry] Non-retryable error: ${err.message}. Bailing out.`);
-                bail(err);
-                return { stdout: '', stderr: '' }; // This never happens due to bail
+                                      err.message.includes('429') || 
+                                      err.message.includes('500'); 
+              if (!isTransientError) { 
+                debugLog(`[Retry] Non-retryable error encountered. Bailing.`);
+                bail(err); 
+                return { stdout: '', stderr: '' }; 
               }
-              
-              // Otherwise, throw to trigger retry
-              throw err;
+              throw err; 
             }
           },
-          {
-            retries: maxRetries,
-            minTimeout: retryDelayMs,
+          { 
+            retries: maxRetries, 
+            minTimeout: retryDelayMs, 
             onRetry: (err: Error, attempt: number) => {
-              console.error(`[Progress] Retry attempt ${attempt}/${maxRetries} due to: ${err.message}`);
+                console.error(`[Progress] Retry attempt ${attempt}/${maxRetries} for claude_code tool due to: ${err.message.split('\n')[0]}`);
+                debugLog(`[Retry Full Error] Attempt ${attempt}:`, err);
             }
           }
         );
 
-        debugLog('[Debug] Claude CLI stdout:', stdout.trim());
-        if (stderr) {
-          debugLog('[Debug] Claude CLI stderr:', stderr.trim());
-        }
+        debugLog('[Debug] Claude CLI stdout:', stdout.trim().substring(0, 200) + (stdout.trim().length > 200 ? "..." : ""));
+        if (stderr) debugLog('[Debug] Claude CLI stderr:', stderr.trim().substring(0, 200) + (stderr.trim().length > 200 ? "..." : ""));
 
-        // Process the output
         let processedOutput = stdout;
-        
-        // For tasks with a parent, add a boomerang marker to help identify responses
-        if (parentTaskId) {
-          // Add a boomerang marker with task info
-          const boomerangInfo = {
-            parentTaskId,
-            returnMode,
-            taskDescription: taskDescription || 'Unknown task',
-            completed: new Date().toISOString()
+        if (currentParentTaskId) { // Use currentParentTaskId
+          const boomerangInfo = { 
+            parentTaskId: currentParentTaskId, // Use currentParentTaskId
+            returnMode: currentReturnMode, // Use currentReturnMode
+            taskDescription: currentTaskDescription || 'Unknown task', // Use currentTaskDescription
+            completed: new Date().toISOString() 
           };
-          
-          // Add a hidden JSON marker that can be detected by the parent task
-          // Format is a special comment that won't interfere with normal content
           const boomerangMarker = `\n\n<!-- BOOMERANG_RESULT ${JSON.stringify(boomerangInfo)} -->`;
           processedOutput += boomerangMarker;
-          
-          debugLog(`[Debug] Added boomerang marker to output for parent task: ${parentTaskId}`);
+          debugLog(`[Debug] Added boomerang marker to output for parent task: ${currentParentTaskId}`); // Use currentParentTaskId
         }
 
-        // Request completed successfully, remove from tracking
         this.activeRequests.delete(requestId);
         debugLog(`[Debug] Request ${requestId} completed successfully`);
-        
-        // Return processed output
         return { content: [{ type: 'text', text: processedOutput }] };
 
       } catch (error: any) {
         debugLog('[Error] Error executing Claude CLI:', error);
         let errorMessage = error.message || 'Unknown error';
-        // Attempt to include stderr and stdout from the error object if spawnAsync attached them
-        if (error.stderr) {
-          errorMessage += `\nStderr: ${error.stderr}`;
-        }
-        if (error.stdout) {
-          errorMessage += `\nStdout: ${error.stdout}`;
-        }
-
-        // Request failed, remove from tracking
+        // Stderr/Stdout might be part of error.message from spawnAsync already
         this.activeRequests.delete(requestId);
         debugLog(`[Debug] Request ${requestId} failed: ${errorMessage}`);
-        
         if (error.signal === 'SIGTERM' || (error.message && error.message.includes('ETIMEDOUT')) || (error.code === 'ETIMEDOUT')) {
-          // Reverting to InternalError due to lint issues, but with a specific timeout message.
           throw new McpError(ErrorCode.InternalError, `Claude CLI command timed out after ${executionTimeoutMs / 1000}s. Details: ${errorMessage}`);
         }
-        // ErrorCode.ToolCallFailed should be ErrorCode.InternalError or a more specific execution error if available
         throw new McpError(ErrorCode.InternalError, `Claude CLI execution failed: ${errorMessage}`);
       }
     });
@@ -796,13 +756,19 @@ ${returnMode === 'summary' ? 'IMPORTANT: Keep your response concise and focused 
    * Start the MCP server
    */
   async run(): Promise<void> {
-    // Revert to original server start logic if listen caused errors
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Claude Code MCP server running on stdio');
+    // --- BEGIN MODIFICATION ---
+    console.error(`Claude Code MCP server (Customized) running on stdio. Restricted to base directory: ${ALLOWED_BASE_WORK_DIRECTORY}`);
+    // --- END MODIFICATION ---
   }
 }
 
 // Create and run the server
 const server = new ClaudeCodeServer();
-server.run().catch(console.error);
+// --- BEGIN MODIFICATION ---
+server.run().catch(error => {
+    console.error("[Critical Server Startup Error]", error); 
+    process.exit(1);
+});
+// --- END MODIFICATION ---
